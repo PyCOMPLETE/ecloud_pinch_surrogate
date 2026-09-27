@@ -1,0 +1,1 @@
+pyecloud[pyheadtail]>=8.7.2

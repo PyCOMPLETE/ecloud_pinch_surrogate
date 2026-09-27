@@ -1,0 +1,168 @@
+"""Track one bunch with multigrid and record the electron cloud on the finest grid.
+
+Based on 008_test_multigrid_pinch.py. Requires installed PyECLOUD, PyPIC and
+PyHEADTAIL. Input paths are relative to this script. Diagnostics stay in memory;
+interactive plots show electron number density in the x=0, y=0 and z=0 planes.
+
+Ecloud's built-in diagnostics retain the innermost grid, not every refinement
+level. Arrays have shape (n_slices, len(x_grid), len(y_grid)), in increasing z
+order (the bunch is tracked from positive to negative z). A subsequent track()
+replaces Ecloud's logs. The recorded arrays contain the electron contribution only.
+"""
+
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.constants import c, e
+from scipy.interpolate import interp1d
+from scipy.io import loadmat
+
+from PyHEADTAIL.particles.slicing import UniformBinSlicer
+from PyECLOUD.PyEC4PyHT import Ecloud
+from machines_for_testing import LHC
+
+
+input_dir = Path(__file__).resolve().parent
+np.random.seed(12345)
+
+# Beam parameters
+p0_GeV = 2000 # momentum in GeV/c
+epsn_x = epsn_y = 2.5e-6 # normalized emittances in m.rad
+sigma_z = 0.10 # r.m.s bunch length in m
+bunch_intensity = 1e11
+
+# Beam discretization
+z_cut = 2.5e-9 * c # range
+n_slices = 301
+
+# Portion of the machine on which this e-cloud kick acts
+L_ecloud = 1000.
+
+# Initial electron density
+init_unif_edens = 1e7
+
+# Chamber geometry file
+chamber_file = input_dir / 'LHC_chm_ver.mat'
+
+# Macro-particle settings
+n_macroparticles = 3_000_000 # Beam macroparticles
+N_electron_macroparticles = 1_000_000  # target initial count inside the chamber
+N_mp_max = 3_000_000 # size of allocated storage (electrons can multiply)
+
+# Load chamber geometry and compute its area
+chamber_data = loadmat(chamber_file)
+vx = chamber_data['Vx'].ravel()
+vy = chamber_data['Vy'].ravel()
+chamber_area = 0.5 * abs(np.dot(vx, np.roll(vy, -1))
+                         - np.dot(vy, np.roll(vx, -1)))
+
+# Reference macroparticle size for the initial uniform electron density
+nel_mp_ref_0 = init_unif_edens * chamber_area / N_electron_macroparticles
+
+# Generate a bunch (can be easily generalized to other machines)
+machine = LHC(
+    machine_configuration='6.5_TeV_collision_tunes',
+    optics_mode='smooth', n_segments=1, p0=p0_GeV * 1e9 * e / c,
+)
+bunch = machine.generate_6D_Gaussian_bunch(
+    n_macroparticles=n_macroparticles, intensity=bunch_intensity,
+    epsn_x=epsn_x, epsn_y=epsn_y, sigma_z=sigma_z,
+)
+sigma_x = bunch.sigma_x()
+sigma_y = bunch.sigma_y()
+
+# Distort the bunch
+bunch.y += 0.3 * sigma_x * np.sin(bunch.z / sigma_z * 2 * np.pi)
+
+# Beam discretization
+slicer = UniformBinSlicer(n_slices=n_slices, z_cuts=(-z_cut, z_cut))
+
+# Build e-cloud simulation object
+ecloud = Ecloud(
+    L_ecloud=L_ecloud, # scales the strength of the e-cloud interaction
+    # Define how the beam is longitudinally discretized
+    slicer=slicer,
+    # Time step required to resolve the electron cloud dynamics accurately
+    Dt_ref=20e-12,
+    # General settings for the electron cloud simulation
+    pyecl_input_folder=str(input_dir / 'pyecloud_config_LHC'),
+    # Geometry of the chamber
+    chamb_type='polyg',
+    filename_chm=str(chamber_file),
+    # Magnetic field expansion coefficients (multipoles times rigidity)
+    B_multip=[0.],
+    # Initial electron distribution (in this case uniform)
+    init_unif_edens_flag=1,
+    init_unif_edens=init_unif_edens,
+    # Macroparticle size control parameters
+    N_mp_max=N_mp_max,
+    nel_mp_ref_0=nel_mp_ref_0,
+    # Particle-in-cell settings (multi-grid)
+    sparse_solver='scipy_slu',
+    PyPICmode='ShortleyWeller_WithTelescopicGrids',
+    Dh_sc=1e-3, # grid size covering the whole cha
+    f_telescope=0.3,
+    target_grid={
+        'x_min_target': -5 * sigma_x, 'x_max_target': 5 * sigma_x,
+        'y_min_target': -5 * sigma_y, 'y_max_target': 5 * sigma_y,
+        'Dh_target': 0.05 * sigma_x,
+    },
+    N_nodes_discard=10,
+    N_min_Dh_main=10,
+)
+print(f'Initial electron macroparticles: {ecloud.cloudsim.cloud_list[0].MP_e.N_mp:,}'
+      f' (target {N_electron_macroparticles:,})')
+
+# Set these after construction. track() calls _reinitialize() itself to prepare
+# the storage, then _finalize() converts the snapshots to arrays ordered by z.
+ecloud.save_ele_distributions_last_track = True
+ecloud.save_ele_potential_and_field = True
+
+t_start = perf_counter()
+ecloud.track(bunch)
+print(f'Multigrid tracking time: {perf_counter() - t_start:.3f} s')
+
+# This are the quantities we want our surrogate to return
+x_grid = ecloud.spacech_ele.xg.copy()  # m; finest grid, including its boundary
+y_grid = ecloud.spacech_ele.yg.copy()  # m
+z_centers = bunch.get_slices(slicer).z_centers.copy()  # m, increasing order
+rho_ele = ecloud.rho_ele_last_track  # C/m^3 (negative for electrons)
+n_ele = -rho_ele / e  # electron number density, m^-3
+phi_ele = ecloud.phi_ele_last_track  # V
+Ex_ele = ecloud.Ex_ele_last_track  # V/m
+Ey_ele = ecloud.Ey_ele_last_track  # V/m
+
+#########
+# Plots #
+#########
+
+# Interpolate onto the exact zero planes (also works with an even slice count).
+# The z coordinate labels successive cloud snapshots during
+# the bunch passage, not a simultaneous 3D cloud distribution.
+n_at_x0 = interp1d(x_grid, n_ele, axis=1)(0.)  # (z, y)
+n_at_y0 = interp1d(y_grid, n_ele, axis=2)(0.)  # (z, x)
+n_at_z0 = interp1d(z_centers, n_ele, axis=0)(0.)  # (x, y)
+
+plt.close('all')
+
+plt.ion()
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), layout='constrained')
+vmax = max(n_at_x0.max(), n_at_y0.max(), n_at_z0.max())
+for ax, horizontal, vertical, density, xlabel, ylabel, title in (
+    (axes[0], z_centers * 1e2, y_grid * 1e3, n_at_x0.T,
+     'z [cm]', 'y [mm]', 'x = 0'),
+    (axes[1], z_centers * 1e2, x_grid * 1e3, n_at_y0.T,
+     'z [cm]', 'x [mm]', 'y = 0'),
+    (axes[2], x_grid * 1e3, y_grid * 1e3, n_at_z0.T,
+     'x [mm]', 'y [mm]', 'z = 0'),
+):
+    mesh = ax.pcolormesh(horizontal, vertical, density, shading='auto',
+                         vmin=0., vmax=vmax, cmap='viridis')
+    ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
+axes[2].set_aspect('equal')
+fig.colorbar(mesh, ax=axes, label=r'Electron number density [m$^{-3}$]')
+fig.suptitle('Electron cloud pinch — finest grid')
+# Keep the GUI open when launched as a script; its toolbar supports zoom/pan.
+plt.show(block=True)
