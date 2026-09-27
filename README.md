@@ -23,10 +23,10 @@ integration. PyECLOUD and PyPIC compile their native extensions during installat
 From this directory, with an interactive Matplotlib backend available:
 
 ```sh
-python 011_test_multigrid_pinch_record_grid.py
+python 000_example_pinch_record.py
 ```
 
-Use `python -i 011_test_multigrid_pinch_record_grid.py` to inspect the arrays
+Use `python -i 000_example_pinch_record.py` to inspect the arrays
 interactively after closing the figure. The simulation retains electron density,
 potential, and electric field on the finest grid, and plots electron number
 density in the x=0, y=0, and z=0 planes. It does not save simulation output files.
