@@ -1,4 +1,4 @@
-"""Track one bunch with multigrid and record the electron cloud on the finest grid.
+"""Track one bunch with multigrid and record beam and cloud on the finest grid.
 
 Based on 008_test_multigrid_pinch.py. Requires installed PyECLOUD, PyPIC and
 PyHEADTAIL. Input paths are relative to this script. Diagnostics stay in memory;
@@ -7,7 +7,7 @@ interactive plots show electron number density in the x=0, y=0 and z=0 planes.
 Ecloud's built-in diagnostics retain the innermost grid, not every refinement
 level. Arrays have shape (n_slices, len(x_grid), len(y_grid)), in increasing z
 order (the bunch is tracked from positive to negative z). A subsequent track()
-replaces Ecloud's logs. The recorded arrays contain the electron contribution only.
+replaces Ecloud's logs. Beam and electron charge densities are recorded separately.
 """
 
 from pathlib import Path
@@ -119,6 +119,7 @@ print(f'Initial electron macroparticles: {ecloud.cloudsim.cloud_list[0].MP_e.N_m
 # the storage, then _finalize() converts the snapshots to arrays ordered by z.
 ecloud.save_ele_distributions_last_track = True
 ecloud.save_ele_potential_and_field = True
+ecloud.save_beam_distributions_last_track = True
 
 t_start = perf_counter()
 ecloud.track(bunch)
@@ -133,6 +134,13 @@ n_ele = -rho_ele / e  # electron number density, m^-3
 phi_ele = ecloud.phi_ele_last_track  # V
 Ex_ele = ecloud.Ex_ele_last_track  # V/m
 Ey_ele = ecloud.Ey_ele_last_track  # V/m
+
+# Beam charge density on the same (z, x, y) grid as rho_ele.
+rho_beam = ecloud.rho_beam_last_track.copy()  # C/m^3 (positive for protons)
+# PyECLOUD skips beam deposition for empty slices, leaving the previous PIC
+# state in its diagnostics. These slices must have zero beam charge density.
+empty_slices = bunch.get_slices(slicer).n_macroparticles_per_slice == 0
+rho_beam[empty_slices] = 0.
 
 #########
 # Plots #
